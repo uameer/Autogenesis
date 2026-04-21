@@ -8,30 +8,124 @@ running model server — HeartbeatMemorySystem derives all entries
 deterministically from event data.
 """
 
+import importlib.util
 import json
 import re
 import sys
+import textwrap
+import types
+import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-root = str(Path(__file__).resolve().parents[1])
-sys.path.insert(0, root)
+ROOT = Path(__file__).resolve().parents[1]
 
-from src.memory.heartbeat_memory_system import (
-    HeartbeatCombinedMemory,
-    HeartbeatInsight,
-    HeartbeatMemorySystem,
-    HeartbeatSummary,
-    _entry_to_insight,
-    _event_to_jsonl_entry,
-    _make_insight,
-    _make_key,
+
+# ---------------------------------------------------------------------------
+# sys.modules stubs — injected before any src.* module is loaded
+# ---------------------------------------------------------------------------
+
+def _stub(name: str, **attrs) -> types.ModuleType:
+    mod = types.ModuleType(name)
+    for k, v in attrs.items():
+        setattr(mod, k, v)
+    sys.modules[name] = mod
+    return mod
+
+
+# inflection — used by Memory.__init__ to auto-derive self.name
+_inflection = _stub("inflection")
+_inflection.underscore = lambda s: re.sub(r"(?<!^)(?=[A-Z])", "_", s).lower()
+
+# mmengine
+_mmengine = _stub("mmengine")
+_mmengine_registry = _stub("mmengine.registry", Registry=MagicMock)
+_mmengine.registry = _mmengine_registry
+
+# src top-level package
+_src = _stub("src")
+
+# src.utils — real implementations of the three helpers used by loaded modules
+def _generate_unique_id(prefix: str = "id") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+@asynccontextmanager
+async def _file_lock(path: str):  # noqa: D401
+    yield
+
+
+_src_utils = _stub(
+    "src.utils",
+    dedent=textwrap.dedent,
+    file_lock=_file_lock,
+    generate_unique_id=_generate_unique_id,
 )
-from src.memory.types import ChatEvent, EventType, Importance
-from src.session import SessionContext
-from src.utils import generate_unique_id
+
+# src.dynamic
+_src_dynamic = _stub("src.dynamic", dynamic_manager=MagicMock())
+
+# src.logger
+_src_logger = _stub("src.logger", logger=MagicMock())
+
+# src.registry — register_module must be a pass-through decorator
+_fake_registry = MagicMock()
+_fake_registry.register_module = lambda **kwargs: (lambda cls: cls)
+_src_registry = _stub("src.registry", MEMORY_SYSTEM=_fake_registry)
+
+# src.memory / src.session package namespaces (populated below)
+_src_memory = _stub("src.memory")
+_src_session = _stub("src.session")
+
+
+# ---------------------------------------------------------------------------
+# Direct importlib loading — bypasses every package __init__.py
+# ---------------------------------------------------------------------------
+
+def _load(module_name: str, file_path: Path) -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_types_mod = _load("src.memory.types", ROOT / "src" / "memory" / "types.py")
+_session_types_mod = _load("src.session.types", ROOT / "src" / "session" / "types.py")
+
+# Expose SessionContext on the src.session namespace so heartbeat_memory_system
+# can resolve `from src.session import SessionContext`.
+_src_session.SessionContext = _session_types_mod.SessionContext
+
+_hb_mod = _load(
+    "src.memory.heartbeat_memory_system",
+    ROOT / "src" / "memory" / "heartbeat_memory_system.py",
+)
+
+
+# ---------------------------------------------------------------------------
+# Bind names used by test functions
+# ---------------------------------------------------------------------------
+
+HeartbeatCombinedMemory = _hb_mod.HeartbeatCombinedMemory
+HeartbeatInsight = _hb_mod.HeartbeatInsight
+HeartbeatMemorySystem = _hb_mod.HeartbeatMemorySystem
+HeartbeatSummary = _hb_mod.HeartbeatSummary
+_entry_to_insight = _hb_mod._entry_to_insight
+_event_to_jsonl_entry = _hb_mod._event_to_jsonl_entry
+_make_insight = _hb_mod._make_insight
+_make_key = _hb_mod._make_key
+
+ChatEvent = _types_mod.ChatEvent
+EventType = _types_mod.EventType
+Importance = _types_mod.Importance
+
+SessionContext = _session_types_mod.SessionContext
+generate_unique_id = _generate_unique_id
 
 
 # ---------------------------------------------------------------------------
